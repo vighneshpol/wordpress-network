@@ -87,9 +87,21 @@ class Pantheon_Cache {
 	 * @return void
 	 */
 	protected function setup() {
+		/**
+		 * Modify the default max-age for the Pantheon cache. Defaults to 1 week (604800 seconds).
+		 *
+		 * Usage:
+		 *  add_filter( 'pantheon_cache_default_max_age', function() {
+		 *      return DAY_IN_SECONDS;
+		 *  } );
+		 *
+		 * @param int $default_ttl The default max-age in seconds.
+		 */
+		$default_ttl = apply_filters( 'pantheon_cache_default_max_age', WEEK_IN_SECONDS );
+
 		$this->options = get_option( self::SLUG, [] );
 		$this->default_options = [
-			'default_ttl' => 600,
+			'default_ttl' => $default_ttl,
 			'maintenance_mode' => 'disabled',
 		];
 		$this->options = wp_parse_args( $this->options, $this->default_options );
@@ -106,12 +118,49 @@ class Pantheon_Cache {
 		add_filter( 'rest_post_dispatch', [ $this, 'filter_rest_post_dispatch_send_cache_control' ], 10, 2 );
 
 		add_action( 'admin_notices', function () {
-			global $wp_object_cache;
-			if ( empty( $wp_object_cache->missing_redis_message ) ) {
+			// Check if WP Redis plugin is active but Redis service is not available.
+			if ( ! function_exists( 'is_plugin_active' ) ) {
+				require_once ABSPATH . 'wp-admin/includes/plugin.php';
+			}
+
+			$wp_redis_active = is_plugin_active( 'wp-redis/wp-redis.php' );
+			$redis_available = isset( $_ENV['CACHE_HOST'] ) && ! empty( $_ENV['CACHE_HOST'] );
+
+			// Only show notice if WP Redis is active but Redis is not available.
+			if ( ! $wp_redis_active || $redis_available ) {
 				return;
 			}
-			$wp_object_cache->missing_redis_message = 'Alert! The Pantheon Redis service needs to be enabled before the WP Redis object cache will function properly.';
-		}, 9 ); // Before the message is displayed in the plugin notice.
+
+			// Suppress the default WP Redis notice if it exists.
+			global $wp_object_cache;
+			if ( isset( $wp_object_cache->missing_redis_message ) ) {
+				$wp_object_cache->missing_redis_message = '';
+			}
+
+			// Get the Pantheon dashboard URL for Redis settings.
+			$redis_path = '';
+			if ( isset( $_ENV['PANTHEON_ENVIRONMENT'] ) ) {
+				$redis_path = '#' . $_ENV['PANTHEON_ENVIRONMENT'] . '/redis';
+			}
+			$dashboard_url = Pantheon\_pantheon_get_dashboard_url( $redis_path );
+
+			$message = sprintf(
+				// translators: %s is a link to the Pantheon Redis documentation.
+				__( 'The Pantheon Redis service needs to be enabled before the WP Redis object cache will function properly. <a href="%s" target="_blank">Learn more about Redis on Pantheon</a>.', 'pantheon-cache' ),
+				'https://docs.pantheon.io/object-cache'
+			);
+
+			Pantheon\_pantheon_render_notice(
+				[
+					'type'        => 'error',
+					'heading'     => __( 'Redis Service Not Enabled', 'pantheon-cache' ),
+					'message'     => $message,
+					'button_text' => __( 'Enable Redis', 'pantheon-cache' ),
+					'button_url'  => $dashboard_url,
+					'dismissible' => false,
+				]
+			);
+		}, 9 );
 
 		add_action( 'shutdown', [ $this, 'cache_clean_urls' ], 999 );
 	}
@@ -167,9 +216,18 @@ class Pantheon_Cache {
 	 */
 	public function action_admin_init() {
 		register_setting( self::SLUG, self::SLUG, [ self::$instance, 'sanitize_options' ] );
-		add_settings_section( 'general', false, '__return_false', self::SLUG );
-		add_settings_field( 'default_ttl', null, [ self::$instance, 'default_ttl_field' ], self::SLUG, 'general' );
-		add_settings_field( 'maintenance_mode', null, [ self::$instance, 'maintenance_mode_field' ], self::SLUG, 'general' );
+		add_settings_section( 'general', false, '__return_false', self::SLUG, [
+			'before_section' => '<div class="pantheon-page-cache-settings">',
+			'after_section' => '</div>',
+		] );
+		add_settings_field( 'default_ttl', null, [ self::$instance, 'default_ttl_field' ], self::SLUG, 'general', [
+			'class' => 'cache-default-max-age',
+			'label_for' => 'default_ttl',
+		] );
+		add_settings_field( 'maintenance_mode', null, [ self::$instance, 'maintenance_mode_field' ], self::SLUG, 'general', [
+			'class' => 'maintenance-mode',
+			'label_for' => 'maintenance_mode',
+		] );
 	}
 
 
@@ -209,14 +267,52 @@ class Pantheon_Cache {
 	}
 
 	/**
-	 * Add the HTML for the default TTL field.
+	 * Add the HTML for the default max-age field.
 	 *
 	 * @return void
 	 */
 	public function default_ttl_field() {
-		echo '<h3>' . esc_html__( 'Default Time to Live (TTL)', 'pantheon-cache' ) . '</h3>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
-		echo '<p>' . esc_html__( 'Maximum time a cached page will be served. A higher TTL typically improves site performance.', 'pantheon-cache' ) . '</p>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
-		echo '<input type="text" name="' . self::SLUG . '[default_ttl]" value="' . $this->options['default_ttl'] . '" size="5" /> ' . esc_html__( 'seconds', 'pantheon-cache' ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		$disabled = ( has_filter( 'pantheon_cache_default_max_age' ) ) ? ' disabled' : '';
+		$default_ttl = ! $disabled ? $this->options['default_ttl'] : apply_filters( 'pantheon_cache_default_max_age', $this->options['default_ttl'] );
+		echo wp_kses_post( apply_filters( 'pantheon_cache_max_age_field_before_html', '<div class="pantheon-cache-default-max-age">' ) );
+		echo '<h3>' . esc_html__( 'Page Cache Max Age', 'pantheon-cache' ) . '</h3>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		echo '<p>' . wp_kses_post( sprintf(
+			// translators: %s is a link to the Pantheon Advanced Page Cache plugin page.
+			__( 'When your site content is updated, <a href="%s">Pantheon Advanced Page Cache</a> clears page cache automatically. This setting determines how long a page will be stored in the Global Content Delivery Network (GCDN) cache before GCDN retrieves the content from WordPress again.', 'pantheon-cache' ),
+			'https://wordpress.org/plugins/pantheon-advanced-page-cache/'
+		) ) . '</p>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		$input_field = '<input type="text" name="' . self::SLUG . '[default_ttl]" value="' . $default_ttl . '" size="7" ' . $disabled . ' /> ' . esc_html__( 'seconds', 'pantheon-cache' );
+		echo wp_kses( apply_filters( 'pantheon_cache_max_age_input', $input_field ), $this->get_cache_max_age_input_allowed_html() );
+		echo wp_kses_post( apply_filters( 'pantheon_cache_max_age_field_after_html', '</div>' ) );
+
+		// Display a message if the setting is disabled.
+		if ( $disabled ) {
+			echo '<p class="pantheon-cache-default-max-age-description">' . esc_html__( 'This setting is disabled because the default max-age has been filtered to the current value.', 'pantheon-cache' ) . '</p>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		}
+	}
+
+	/**
+	 * Get the allowed input HTML for the settings page.
+	 *
+	 * @return array
+	 */
+	private function get_cache_max_age_input_allowed_html() {
+		return apply_filters( 'pantheon_cache_max_age_input_allowed_html', [
+			'input' => [
+				'type' => [],
+				'name' => [],
+				'value' => [],
+				'size' => [],
+				'disabled' => [],
+			],
+			'select' => [
+				'name' => [],
+			],
+			'option' => [
+				'value' => [],
+				'selected' => [],
+			],
+		] );
 	}
 
 	/**
@@ -265,20 +361,52 @@ class Pantheon_Cache {
 	 */
 	public function view_settings_page() {
 		?>
-		<div class="wrap">
+		<div class="wrap pantheon-page-cache">
 			<h2><?php esc_html_e( 'Pantheon Page Cache', 'pantheon-cache' ); ?></h2>
 
-			<?php if ( ! empty( $_GET['cache-cleared'] ) && 'true' === $_GET['cache-cleared'] ) : ?>
-				<div class="updated below-h2">
-					<p><?php esc_html_e( 'Site cache flushed.', 'pantheon-cache' ); ?></p>
-				</div>
-			<?php endif ?>
+			<?php
+			if ( ! empty( $_GET['cache-cleared'] ) && 'true' === $_GET['cache-cleared'] ) :
+				Pantheon\_pantheon_render_notice(
+					[
+						'type'        => 'success',
+						'message'     => __( 'Site cache flushed.', 'pantheon-cache' ),
+						'dismissible' => true,
+					]
+				);
+			endif;
+			?>
 
-			<?php if ( class_exists( 'Pantheon_Advanced_Page_Cache\Purger' ) ) : // translators: %s is a link. ?>
-				<div class="notice notice-success"><p><?php echo wp_kses_post( sprintf( __( 'Pantheon Advanced Page Cache activated. <a target="_blank" href="%s">Learn more</a>', 'pantheon-cache' ), 'https://docs.pantheon.io/guides/wordpress-configurations/wordpress-cache-plugin' ) ); ?></p></div>
-			<?php else : // translators: %s is a link. ?>
-				<div class="notice notice-warning"><p><?php echo wp_kses_post( sprintf( __( 'Want to automatically clear related pages when you update content? Learn more about the <a href="%s">Pantheon Advanced Page Cache</a>.', 'pantheon-cache' ), 'https://docs.pantheon.io/guides/wordpress-configurations/wordpress-cache-plugin' ) ); ?></p></div>
-			<?php endif; ?>
+			<?php
+			if ( class_exists( 'Pantheon_Advanced_Page_Cache\Purger' ) ) :
+				$message = sprintf(
+					// translators: %s is a link.
+					__( 'Pantheon Advanced Page Cache activated. <a target="_blank" href="%s">Learn more</a>', 'pantheon-cache' ),
+					'https://docs.pantheon.io/guides/wordpress-configurations/wordpress-cache-plugin'
+				);
+				Pantheon\_pantheon_render_notice(
+					[
+						'type'    => 'success',
+						'heading' => __( 'Advanced Page Cache Active', 'pantheon-cache' ),
+						'message' => $message,
+					]
+				);
+			else :
+				$message = sprintf(
+					// translators: %s is a link.
+					__( 'Want to automatically clear related pages when you update content? Learn more about the <a href="%s">Pantheon Advanced Page Cache</a>.', 'pantheon-cache' ),
+					'https://docs.pantheon.io/guides/wordpress-configurations/wordpress-cache-plugin'
+				);
+				Pantheon\_pantheon_render_notice(
+					[
+						'type'        => 'info',
+						'heading'     => __( 'Enhance Your Cache', 'pantheon-cache' ),
+						'message'     => $message,
+						'button_text' => __( 'Install Plugin', 'pantheon-cache' ),
+						'button_url'  => admin_url( 'plugin-install.php?s=pantheon+advanced+page+cache&tab=search&type=term' ),
+					]
+				);
+			endif;
+			?>
 
 			<?php
 			/**
@@ -290,7 +418,7 @@ class Pantheon_Cache {
 
 			<?php if ( apply_filters( 'pantheon_cache_allow_clear_all', true ) ) : ?>
 
-				<form action="admin-post.php" method="POST">
+				<form action="admin-post.php" method="POST" class="clear-site-cache">
 					<input type="hidden" name="action" value="pantheon_cache_flush_site" />
 					<?php wp_nonce_field( 'pantheon-cache-clear-all', 'pantheon-cache-nonce' ); ?>
 					<h3><?php esc_html_e( 'Clear Site Cache', 'pantheon-cache' ); ?></h3>
@@ -345,7 +473,7 @@ class Pantheon_Cache {
 	 */
 	private function get_cache_control_header_value() {
 		if ( ! is_admin() && ! is_user_logged_in() ) {
-			$ttl = absint( $this->options['default_ttl'] );
+			$ttl = apply_filters( 'pantheon_cache_default_max_age', absint( $this->options['default_ttl'] ) );
 			if ( $ttl < 60 && isset( $_ENV['PANTHEON_ENVIRONMENT'] ) && 'live' === $_ENV['PANTHEON_ENVIRONMENT'] ) {
 				$ttl = 60;
 			}
@@ -362,6 +490,19 @@ class Pantheon_Cache {
 	 * @return void
 	 */
 	public function cache_add_headers() {
+		/**
+		 * Filter to skip the cache control header.
+		 *
+		 * @param bool $skip_cache_control Whether to skip the cache control header.
+		 * @see https://github.com/pantheon-systems/pantheon-mu-plugin/issues/37
+		 * @return bool
+		 */
+		$skip_cache_control = apply_filters( 'pantheon_skip_cache_control', false );
+
+		if ( $skip_cache_control ) {
+			return;
+		}
+
 		header( sprintf( 'cache-control: %s', $this->get_cache_control_header_value() ) );
 	}
 

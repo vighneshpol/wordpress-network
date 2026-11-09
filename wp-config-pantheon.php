@@ -60,8 +60,12 @@ if (isset($_SERVER['HTTP_HOST'])) {
         $scheme = 'https';
         $_SERVER['HTTPS'] = 'on';
     }
-    define('WP_HOME', $scheme . '://' . $_SERVER['HTTP_HOST']);
-    define('WP_SITEURL', $scheme . '://' . $_SERVER['HTTP_HOST']);
+    if (!defined('WP_HOME')) {
+        define('WP_HOME', $scheme . '://' . $_SERVER['HTTP_HOST']);
+    }
+    if (!defined('WP_SITEURL')) {
+        define('WP_SITEURL', $scheme . '://' . $_SERVER['HTTP_HOST']);
+    }
 }
 // Don't show deprecations; useful under PHP 5.5
 error_reporting(E_ALL ^ E_DEPRECATED);
@@ -95,6 +99,13 @@ if (getenv('WP_ENVIRONMENT_TYPE') === false) {
  *
  * To override, define your constant in your wp-config.php before wp-config-pantheon.php is required.
  */
+
+if ( ! defined('PANTHEON_HOSTNAME' ) ) {
+    $site_name = $_ENV['PANTHEON_SITE_NAME'];
+    $hostname = isset( $_SERVER['HTTP_HOST'] ) ? $_SERVER['HTTP_HOST'] : $_ENV['PANTHEON_ENVIRONMENT'] . "-{$site_name}.pantheonsite.io" ;
+    $hostname = isset( $_ENV['LANDO'] ) ? "{$site_name}.lndo.site" : $hostname;
+    define( 'PANTHEON_HOSTNAME', $hostname );
+}
 
 /** Disable wp-cron.php from running on every page load and rely on Pantheon to run cron via wp-cli */
 $network = isset($_ENV["FRAMEWORK"]) && $_ENV["FRAMEWORK"] === "wordpress_network";
